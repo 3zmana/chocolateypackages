@@ -1,1 +1,1 @@
-Packages abandoned
+Packages for netsetman.
