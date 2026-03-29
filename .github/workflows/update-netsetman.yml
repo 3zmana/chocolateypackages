@@ -1,9 +1,7 @@
 name: Update NetSetMan Package
 
 on:
-  schedule:
-    - cron: '0 8 * * *'   # Every day at 8:00 UTC
-  workflow_dispatch:        # Manual trigger available
+  workflow_dispatch:   # Manual trigger only
 
 permissions:
   contents: write
