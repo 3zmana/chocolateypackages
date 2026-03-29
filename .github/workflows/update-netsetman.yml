@@ -1,0 +1,151 @@
+name: Update NetSetMan Package
+
+on:
+  schedule:
+    - cron: '0 8 * * *'   # Every day at 8:00 UTC
+  workflow_dispatch:        # Manual trigger available
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  check-and-update:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ---------------------------------------------------------------
+      # 1. Version detection
+      # ---------------------------------------------------------------
+      - name: Check for new version
+        id: version_check
+        shell: pwsh
+        run: |
+          # Fetch the history page
+          $response = Invoke-WebRequest -Uri "https://www.netsetman.com/en/txt/history" -UseBasicParsing
+          $match = [regex]::Match($response.Content, '\*\*(\d+\.\d+\.\d+) - (\d{4}-\d{2}-\d{2})\*\*')
+
+          if (-not $match.Success) {
+            Write-Error "Could not detect version from history page."
+            exit 1
+          }
+
+          $latestVersion = $match.Groups[1].Value
+          $releaseDate   = $match.Groups[2].Value
+
+          # Read current version from nuspec
+          [xml]$nuspec = Get-Content "NetSetMan/Source/netsetman.nuspec" -Encoding UTF8
+          $currentVersion = $nuspec.package.metadata.version
+
+          Write-Host "Current version : $currentVersion"
+          Write-Host "Latest version  : $latestVersion ($releaseDate)"
+
+          if ($latestVersion -ne $currentVersion) {
+            Write-Host "New version detected!"
+            "update_needed=true"         >> $env:GITHUB_OUTPUT
+            "new_version=$latestVersion" >> $env:GITHUB_OUTPUT
+            "current_version=$currentVersion" >> $env:GITHUB_OUTPUT
+          } else {
+            Write-Host "Package is already up to date."
+            "update_needed=false" >> $env:GITHUB_OUTPUT
+          }
+
+      # ---------------------------------------------------------------
+      # 2. Download installer and compute checksum
+      # ---------------------------------------------------------------
+      - name: Download installer and compute SHA256
+        if: steps.version_check.outputs.update_needed == 'true'
+        id: download
+        shell: pwsh
+        run: |
+          Write-Host "Downloading NetSetMan ${{ steps.version_check.outputs.new_version }}..."
+          Invoke-WebRequest -Uri "https://www.netsetman.com/download.php" -OutFile "installer.exe"
+
+          $fileSize = (Get-Item "installer.exe").Length
+          Write-Host "File size : $([math]::Round($fileSize / 1MB, 2)) MB"
+
+          $hash = (Get-FileHash "installer.exe" -Algorithm SHA256).Hash.ToLower()
+          Write-Host "SHA256 : $hash"
+
+          "checksum=$hash" >> $env:GITHUB_OUTPUT
+
+      # ---------------------------------------------------------------
+      # 3. Update source files
+      # ---------------------------------------------------------------
+      - name: Update nuspec and install script
+        if: steps.version_check.outputs.update_needed == 'true'
+        shell: pwsh
+        run: |
+          $newVersion     = "${{ steps.version_check.outputs.new_version }}"
+          $currentVersion = "${{ steps.version_check.outputs.current_version }}"
+          $checksum       = "${{ steps.download.outputs.checksum }}"
+
+          # --- nuspec: update version number ---
+          $nuspecPath = "NetSetMan/Source/netsetman.nuspec"
+          $nuspecContent = Get-Content $nuspecPath -Raw -Encoding UTF8
+          $nuspecContent = $nuspecContent -replace "<version>$([regex]::Escape($currentVersion))</version>",
+                                                    "<version>$newVersion</version>"
+          Set-Content $nuspecPath -Value $nuspecContent -Encoding UTF8 -NoNewline
+
+          # --- chocolateyinstall.ps1: update checksum ---
+          $installPath = "NetSetMan/Source/tools/chocolateyinstall.ps1"
+          $installContent = Get-Content $installPath -Raw -Encoding UTF8
+          $installContent = $installContent -replace "checksum\s+=\s+'[a-fA-F0-9]+'",
+                                                      "checksum      = '$checksum'"
+          Set-Content $installPath -Value $installContent -Encoding UTF8 -NoNewline
+
+          Write-Host "Files updated successfully."
+
+      # ---------------------------------------------------------------
+      # 4. Build Chocolatey package
+      # ---------------------------------------------------------------
+      - name: Build .nupkg
+        if: steps.version_check.outputs.update_needed == 'true'
+        shell: pwsh
+        run: |
+          choco pack "NetSetMan/Source/netsetman.nuspec" --out "NetSetMan/packages/"
+          Write-Host "Package built:"
+          Get-ChildItem "NetSetMan/packages/netsetman.${{ steps.version_check.outputs.new_version }}.nupkg"
+
+      # ---------------------------------------------------------------
+      # 5. Create Pull Request
+      # ---------------------------------------------------------------
+      - name: Create Pull Request
+        if: steps.version_check.outputs.update_needed == 'true'
+        uses: peter-evans/create-pull-request@v6
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          commit-message: "Update NetSetMan to ${{ steps.version_check.outputs.new_version }}"
+          branch: "update/netsetman-${{ steps.version_check.outputs.new_version }}"
+          delete-branch: true
+          title: "Update NetSetMan ${{ steps.version_check.outputs.current_version }} → ${{ steps.version_check.outputs.new_version }}"
+          body: |
+            Automated update detected for **NetSetMan**.
+
+            | | |
+            |---|---|
+            | Previous version | `${{ steps.version_check.outputs.current_version }}` |
+            | New version      | `${{ steps.version_check.outputs.new_version }}` |
+            | SHA256           | `${{ steps.download.outputs.checksum }}` |
+
+            Please review the checksum and merge to publish the package.
+          labels: |
+            automated
+            update
+
+      # ---------------------------------------------------------------
+      # 6. (Optional) Push to Chocolatey.org
+      #    Requires the CHOCO_API_KEY secret in the repository settings
+      # ---------------------------------------------------------------
+      - name: Push to Chocolatey.org
+        if: steps.version_check.outputs.update_needed == 'true' && env.CHOCO_API_KEY != ''
+        env:
+          CHOCO_API_KEY: ${{ secrets.CHOCO_API_KEY }}
+        shell: pwsh
+        run: |
+          $nupkg = "NetSetMan/packages/netsetman.${{ steps.version_check.outputs.new_version }}.nupkg"
+          choco push $nupkg --source https://push.chocolatey.org --api-key $env:CHOCO_API_KEY
+          Write-Host "Package published to Chocolatey.org."
